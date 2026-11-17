@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -191,6 +192,44 @@ pub fn exit_current_and_run_next() {
 /// Get the current 'Running' task's token.
 pub fn current_user_token() -> usize {
     TASK_MANAGER.get_current_token()
+}
+
+/// Map new pages in the current task's owned address space.
+pub fn mmap_current(start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .memory_set
+        .map_free_range(start, end, permission)
+}
+
+
+/// Map new pages in the current task's owned address space.
+pub fn munmap_current(start: VirtAddr,len :usize) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.unmap_range(start, len)
+    
+}
+
+/// Count the syscall before dispatch, including sys_trace itself.
+pub fn record_syscall(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_counts.get_mut(syscall_id) {
+        *count += 1;
+    }
+}
+
+/// Get the number of calls to a syscall made by the current task.
+pub fn get_current_syscall_count(syscall_id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .syscall_counts
+        .get(syscall_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Get the current 'Running' task's trap contexts.
