@@ -4,12 +4,15 @@ use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use lazy_static::*;
+
+
+const BIG_STRIDE:u128 = 1u128 << 64;
 ///A array of `TaskControlBlock` that is thread-safe
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// A  stride scheduler.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -23,8 +26,18 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let index = self.ready_queue.iter().enumerate().min_by_key(|(_,task)|{task.inner_exclusive_access().stride}).map(|(index,_)|index)?;
+
+        let task = self.ready_queue.remove(index)?;
+
+        {
+            let mut inner = task.inner_exclusive_access();
+            let pass = BIG_STRIDE / inner.priority as u128;
+            inner.stride += pass;
+        }
+        Some(task)
     }
+    
 }
 
 lazy_static! {
