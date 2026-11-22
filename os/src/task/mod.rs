@@ -23,6 +23,7 @@ mod switch;
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::mm::{MapPermission, VirtAddr};
 use alloc::sync::Arc;
 pub use context::TaskContext;
 use lazy_static::*;
@@ -119,4 +120,18 @@ lazy_static! {
 ///Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
+}
+
+/// Map pages in the current process's owned address space.
+pub fn mmap_current(start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.map_free_range(start, end, permission)
+}
+
+/// Unmap pages from the current process's owned address space.
+pub fn munmap_current(start: VirtAddr, len: usize) -> bool {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.unmap_range(start, len)
 }

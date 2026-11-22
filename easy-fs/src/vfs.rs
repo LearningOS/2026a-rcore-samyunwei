@@ -183,4 +183,164 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+
+    /// Get the inode number.
+    pub fn inode_id(&self) -> u32{
+        self.fs.lock().get_disk_inode_id(self.block_id as u32, self.block_offset)
+    }
+
+    /// 检查文件夹是否是目录
+    pub fn is_dir(&self) -> bool{
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+
+    ///  用node_id 索引统计文件夹
+    pub fn link_count(&self,inode_id:u32) -> u32{
+        let _fs = self.fs.lock();
+
+        self.read_disk_inode(|disk_inode|{
+            assert!(disk_inode.is_dir());
+            
+            let file_count = disk_inode.size as usize / DIRENT_SZ;
+            let mut dirent = DirEntry::empty();
+            let mut count = 0;
+
+
+            for i in 0..file_count{
+                assert_eq!(disk_inode.read_at(i * DIRENT_SZ,dirent.as_bytes_mut(),&self.block_device),DIRENT_SZ);
+                
+                if !dirent.name().is_empty() && dirent.inode_id() == inode_id{
+                    count += 1;
+                }
+            }
+            count
+        })
+
+        
+    }
+
+    /// 新建一个目录节点
+    pub fn link(&self,old_name:&str,new_name:&str) ->bool{
+        if old_name == new_name
+            || old_name.is_empty()
+            || new_name.is_empty()
+            || new_name.len() > 27
+            || new_name.as_bytes().contains(&0)
+        {
+            return false;
+        }
+
+        let mut fs = self.fs.lock();
+
+        let inode_id = self.read_disk_inode(|dir_inode|{
+            assert!(dir_inode.is_dir());
+
+            if self.find_inode_id(new_name, dir_inode).is_some(){
+                return None;
+            }
+            self.find_inode_id(old_name, dir_inode)
+        });
+
+
+        let Some(inode_id) = inode_id else{
+            return false;
+        };
+
+        self.modify_disk_inode(|dir_inode|{
+            let offset = dir_inode.size as usize;
+            let new_size = offset + DIRENT_SZ;
+
+            self.increase_size(new_size as u32, dir_inode, &mut fs);
+
+            let dirent = DirEntry::new(new_name,inode_id);
+
+            assert_eq!(dir_inode.write_at(offset,dirent.as_bytes(), &self.block_device),DIRENT_SZ);
+        });
+
+        block_cache_sync_all();
+        true
+    }
+
+    /// 删掉文件夹entry
+    fn remove_dir_entry(&self,name:&str,fs:&mut MutexGuard<EasyFileSystem>) -> Option<u32>{
+        if name.is_empty(){
+            return None;
+        }
+
+        self.modify_disk_inode(|dir_inode|{
+            assert!(dir_inode.is_dir());
+
+
+            let file_count = dir_inode.size as usize / DIRENT_SZ;
+            let mut entrites :Vec<DirEntry> = Vec::new();
+            let mut removed = None;
+
+
+            for i in 0..file_count{
+                let mut dirent = DirEntry::empty();
+
+
+                assert_eq!(dir_inode.read_at(i* DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),DIRENT_SZ);
+
+                if dirent.name() == name{
+                    removed = Some(dirent.inode_id());
+                }else{
+                    entrites.push(dirent);
+                }
+            }
+
+            let inode_id = removed?;
+
+            let blocks = dir_inode.clear_size(&self.block_device);
+            for block in blocks{
+                fs.dealloc_data(block);
+            }
+
+            let new_size = entrites.len() * DIRENT_SZ;
+
+            self.increase_size(new_size as u32, dir_inode, fs);
+
+            for (i,dirent) in entrites.iter().enumerate(){
+                assert_eq!(dir_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device),DIRENT_SZ);
+            }
+
+            Some(inode_id)
+        })
+    }
+
+    ///unlink
+    pub fn unlink(&self,name:&str) -> Option<u32>{
+        let mut fs = self.fs.lock();
+
+        let inode_id = self.remove_dir_entry(name, &mut fs)?;
+
+        block_cache_sync_all();
+        Some(inode_id)
+    }
+
+    ///回收接口
+    pub fn reclaim(&self){
+        let mut fs = self.fs.lock();
+
+
+        let inode_id = fs.get_disk_inode_id(self.block_id as u32,self.block_offset);
+
+        assert_ne!(inode_id,0,"cannot reclaim the root inode");
+
+        self.modify_disk_inode(|disk_inode|{
+            assert!(disk_inode.is_file());
+
+            let blocks = disk_inode.clear_size(&self.block_device);
+
+            for block in blocks{
+                fs.dealloc_data(block);
+            }
+        });
+
+        fs.dealloc_inode(inode_id);
+        block_cache_sync_all();
+
+    }
+    
 }

@@ -1,6 +1,11 @@
 //! Process management syscalls
 //!
+use crate::config::PAGE_SIZE;
+use crate::mm::{translated_byte_buffer, MapPermission, PTEFlags, PageTable, VirtAddr};
+use crate::task::TaskControlBlock;
+use crate::timer::get_time_us;
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use crate::{
     fs::{open_file, OpenFlags},
@@ -16,6 +21,31 @@ use crate::{
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
+}
+
+/// Check the entire user buffer before writing through the kernel mapping.
+pub(super) fn user_range_accessible(token: usize, start: usize, len: usize, permission: PTEFlags) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let page_table = PageTable::from_token(token);
+    let required = PTEFlags::V | PTEFlags::U | permission;
+    let mut address = start;
+    while address < end {
+        let va = VirtAddr::from(address);
+        // VirtAddr::from truncates high bits; reject noncanonical Sv39 addresses.
+        if usize::from(va) != address {
+            return false;
+        }
+        let Some(pte) = page_table.translate(va.floor()) else {
+            return false;
+        };
+        if !pte.flags().contains(required) {
+            return false;
+        }
+        address += (end - address).min(PAGE_SIZE - va.page_offset());
+    }
+    true
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -102,33 +132,100 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Write the current time to a validated user buffer, including across pages.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel: sys_get_time");
+    let us = get_time_us();
+    let sec = us / 1_000_000;
+    let usec = us % 1_000_000;
+
+    let word_size = size_of::<usize>();
+    let mut bytes = [0u8; 2 * size_of::<usize>()];
+
+    bytes[..word_size].copy_from_slice(&sec.to_ne_bytes());
+    bytes[word_size..].copy_from_slice(&usec.to_ne_bytes());
+
+    let token = current_user_token();
+    // Validate the whole structure before writing any of its bytes.
+    if !user_range_accessible(token, ts as usize, bytes.len(), PTEFlags::W) {
+        return -1;
+    }
+    let buffers = translated_byte_buffer(token, ts as *const u8, bytes.len());
+
+    let mut offset = 0;
+    for buffer in buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&bytes[offset..offset + len]);
+        offset += len;
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Allocate user pages with the requested R/W/X permissions.
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel: sys_mmap");
+    if start % PAGE_SIZE != 0 || port == 0 || port & !0x7 != 0 {
+        return -1;
+    }
+    let start_va = VirtAddr::from(start);
+    if usize::from(start_va) != start {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return -1;
+    };
+    // Reject noncanonical addresses and ranges crossing the Sv39 address hole.
+    let last = end - 1;
+    if usize::from(VirtAddr::from(last)) != last || start >> 38 != last >> 38 {
+        return -1;
+    }
+
+    let mut permission = MapPermission::U;
+    if port & 0b001 != 0 {
+        permission |= MapPermission::R;
+    }
+    if port & 0b010 != 0 {
+        permission |= MapPermission::W;
+    }
+    if port & 0b100 != 0 {
+        permission |= MapPermission::X;
+    }
+    if crate::task::mmap_current(start_va, VirtAddr::from(end), permission) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Release an aligned range of owned user pages.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel: sys_munmap");
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let start_va = VirtAddr::from(start);
+    if usize::from(start_va) != start {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return -1;
+    };
+    // Reject noncanonical addresses and ranges crossing the Sv39 address hole.
+    let last = end - 1;
+    if usize::from(VirtAddr::from(last)) != last || start >> 38 != last >> 38 {
+        return -1;
+    }
+    if crate::task::munmap_current(start_va, len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +238,38 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Create a child directly from an executable stored in easy-fs.
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+
+    let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) else {
+        return -1;
+    };
+    let elf_data = app_inode.read_all();
+
+    let parent = current_task().unwrap();
+    let child = Arc::new(TaskControlBlock::new(elf_data.as_slice()));
+    let child_pid = child.getpid();
+    {
+        let mut child_inner = child.inner_exclusive_access();
+        child_inner.parent = Some(Arc::downgrade(&parent));
+    }
+    {
+        let mut parent_inner = parent.inner_exclusive_access();
+        parent_inner.children.push(Arc::clone(&child));
+    }
+    add_task(child);
+    child_pid as isize
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Set scheduling priority; values below 2 are invalid.
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.priority = prio as usize;
+    prio
 }

@@ -121,6 +121,16 @@ impl EasyFileSystem {
             (inode_id % inodes_per_block) as usize * inode_size,
         )
     }
+
+    /// Get the inode number from its position on disk.
+    pub fn get_disk_inode_id(&self,block_id:u32,block_offset:usize) -> u32{
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+
+        (block_id - self.inode_area_start_block) * inodes_per_block + (block_offset / inode_size) as u32
+
+    }
+
     /// Get data block by id
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
@@ -147,5 +157,12 @@ impl EasyFileSystem {
             &self.block_device,
             (block_id - self.data_area_start_block) as usize,
         )
+    }
+
+    /// 从bitmap 释放inode
+    pub fn dealloc_inode(&mut self,inode_id:u32){
+        assert_ne!(inode_id,0,"cannot dellocate the root inode");
+
+        self.inode_bitmap.dealloc(&self.block_device, inode_id as usize);
     }
 }

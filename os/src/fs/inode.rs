@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File,Stat,StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
+use alloc::collections::BTreeMap;
 
 /// inode in memory
 /// A wrapper around a filesystem inode
@@ -31,6 +32,12 @@ pub struct OSInodeInner {
 impl OSInode {
     /// create a new inode in memory
     pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+        let inode_id = inode.inode_id();
+        {
+            let mut counts = OPEN_INODE_COUNTS.exclusive_access();
+            *counts.entry(inode_id).or_insert(0) += 1;
+        }
+        
         Self {
             readable,
             writable,
@@ -59,6 +66,10 @@ lazy_static! {
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
+    };
+
+    static ref OPEN_INODE_COUNTS:UPSafeCell<BTreeMap<u32,usize>> = unsafe{
+        UPSafeCell::new(BTreeMap::new())
     };
 }
 
@@ -125,6 +136,40 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// 在根节点上操作文件
+pub fn link_file(old_name:&str,new_name:&str) -> bool{
+    ROOT_INODE.link(old_name, new_name)
+}
+
+
+///取消链接接口
+pub fn unlink_file(name:&str) ->bool{
+    let Some(inode) = ROOT_INODE.find(name) else{
+        return false;
+    };
+
+    if inode.is_dir(){
+        return false;
+    }
+
+    let Some(inode_id) = ROOT_INODE.unlink(name) else{
+        return false;
+    };
+
+
+    let still_open = OPEN_INODE_COUNTS.exclusive_access().contains_key(&inode_id);
+
+
+    if !still_open && ROOT_INODE.link_count(inode_id) == 0 {
+        inode.reclaim();
+    }
+
+    true
+
+
+
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -156,4 +201,56 @@ impl File for OSInode {
         }
         total_write_size
     }
+
+    fn stat(&self) -> Option<Stat>{
+        let inode = self.inner.exclusive_access().inode.clone();
+
+        let ino = inode.inode_id();
+        let mode = if inode.is_dir(){
+            StatMode::DIR
+        }else{
+            StatMode::FILE
+        };
+        let nlink = ROOT_INODE.link_count(ino);
+
+        Some(Stat{
+            dev:0,
+            ino:ino as u64,
+            mode,
+            nlink,
+            pad:[0;7],
+        })
+        
+    }
+
+    
+}
+
+
+impl Drop for OSInode {
+
+    ///删除节点
+    fn drop(&mut self){
+        let inode = self.inner.exclusive_access().inode.clone();
+        let inode_id = inode.inode_id();
+
+        let last_open = {
+            let mut counts = OPEN_INODE_COUNTS.exclusive_access();
+            let count = counts.get_mut(&inode_id).expect("missing open inode count");
+
+            *count -= 1;
+            let last_open = *count == 0;
+
+            if last_open{
+                counts.remove(&inode_id);
+            }
+
+            last_open
+        };
+
+        if last_open && ROOT_INODE.link_count(inode_id) == 0{
+            inode.reclaim();
+        }
+    }
+    
 }
