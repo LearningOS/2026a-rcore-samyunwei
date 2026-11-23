@@ -23,6 +23,19 @@ pub struct ProcessControlBlock {
     inner: UPSafeCell<ProcessControlBlockInner>,
 }
 
+/// 死锁检查记录
+#[derive(Default)]
+pub struct DeadlockDetector {
+    ///可用资源
+    pub available: Vec<usize>,
+
+    ///使用中的资源
+    pub allocation: Vec<Vec<usize>>,
+
+    ///线程i未满足j类资源的申请
+    pub need: Vec<Vec<usize>>,
+}
+
 /// Inner of Process Control Block
 pub struct ProcessControlBlockInner {
     /// is zombie?
@@ -49,6 +62,15 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+
+    ///进程死锁检查开关
+    pub deadlock_detcted_enable: bool,
+
+    ///锁的死锁
+    pub mutex_dealock: DeadlockDetector,
+
+    ///信号量检查
+    pub semaphore_deadlock: DeadlockDetector,
 }
 
 impl ProcessControlBlockInner {
@@ -68,7 +90,12 @@ impl ProcessControlBlockInner {
     }
     /// allocate a new task id
     pub fn alloc_tid(&mut self) -> usize {
-        self.task_res_allocator.alloc()
+        let tid = self.task_res_allocator.alloc();
+
+        self.mutex_dealock.ensure_thread(tid);
+        self.semaphore_deadlock.ensure_thread(tid);
+
+        tid
     }
     /// deallocate a task id
     pub fn dealloc_tid(&mut self, tid: usize) {
@@ -119,6 +146,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detcted_enable: false,
+                    mutex_dealock: DeadlockDetector::default(),
+                    semaphore_deadlock: DeadlockDetector::default(),
                 })
             },
         });
@@ -245,6 +275,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detcted_enable: false,
+                    mutex_dealock: DeadlockDetector::default(),
+                    semaphore_deadlock: DeadlockDetector::default(),
                 })
             },
         });
@@ -281,5 +314,88 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+}
+
+impl DeadlockDetector {
+    ///初始化线程资源
+    pub fn ensure_thread(&mut self, tid: usize) {
+        let resource_count = self.available.len();
+
+        while self.allocation.len() <= tid {
+            self.allocation.push(vec![0; resource_count]);
+            self.need.push(vec![0; resource_count])
+        }
+    }
+
+    ///增加线程资源
+    pub fn add_resource(&mut self, resource_id: usize, count: usize) {
+        let resource_count = self.available.len().max(resource_id + 1);
+
+        self.available.resize(resource_count, 0);
+        self.available[resource_id] = count;
+
+        for row in self.allocation.iter_mut() {
+            row.resize(resource_count, 0);
+            row[resource_id] = 0;
+        }
+
+        for row in self.need.iter_mut() {
+            row.resize(resource_count, 0);
+            row[resource_id] = 0;
+        }
+    }
+
+    pub fn is_safe(&self) -> bool {
+        let mut work = self.available.clone();
+        let mut finish = vec![false; self.allocation.len()];
+
+        loop {
+            let mut progress = false;
+
+            for tid in 0..finish.len() {
+                if finish[tid] {
+                    continue;
+                }
+                let can_finish = (0..work.len())
+                    .all(|resource_id| self.need[tid][resource_id] <= work[resource_id]);
+                if can_finish {
+                    for (resource_id, available) in work.iter_mut().enumerate() {
+                        *available += self.allocation[tid][resource_id];
+                    }
+                    finish[tid] = true;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        finish.iter().all(|done| *done)
+    }
+
+    pub fn request(&mut self,tid:usize,resource_id:usize,detect:bool) -> bool{
+        self.ensure_thread(tid);
+        self.need[tid][resource_id] += 1;
+
+        if detect && !self.is_safe(){
+            self.need[tid][resource_id] -= 1;
+            return false;
+        }
+
+        true
+    }
+
+    pub fn acquired(&mut self,tid:usize,resource_id: usize){
+        self.need[tid][resource_id] -= 1;
+        self.available[resource_id] -= 1;
+        self.allocation[tid][resource_id] +=1;
+    }
+
+    pub fn release(&mut self,tid:usize,resource_id:usize){
+        if self.allocation[tid][resource_id] > 0{
+            self.allocation[tid][resource_id] -= 1;
+        }
+        self.available[resource_id] += 1;
     }
 }

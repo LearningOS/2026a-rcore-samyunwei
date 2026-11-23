@@ -1,3 +1,6 @@
+use crate::config::PAGE_SIZE;
+use crate::mm::{translated_byte_buffer, PTEFlags, PageTable, VirtAddr};
+use crate::timer::get_time_us;
 use crate::{
     fs::{open_file, OpenFlags},
     mm::{translated_ref, translated_refmut, translated_str},
@@ -7,12 +10,38 @@ use crate::{
     },
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::mem::size_of;
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
+}
+
+/// Check the entire user buffer before writing through the kernel mapping.
+fn user_range_accessible(token: usize, start: usize, len: usize, permission: PTEFlags) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let page_table = PageTable::from_token(token);
+    let required = PTEFlags::V | PTEFlags::U | permission;
+    let mut address = start;
+    while address < end {
+        let va = VirtAddr::from(address);
+        // VirtAddr::from truncates high bits; reject noncanonical Sv39 addresses.
+        if usize::from(va) != address {
+            return false;
+        }
+        let Some(pte) = page_table.translate(va.floor()) else {
+            return false;
+        };
+        if !pte.flags().contains(required) {
+            return false;
+        }
+        address += (end - address).min(PAGE_SIZE - va.page_offset());
+    }
+    true
 }
 
 /// exit syscall
@@ -146,17 +175,31 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     }
 }
 
-/// get_time syscall
-///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+/// Write the current time to a validated user buffer, including across pages.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel: sys_get_time");
+    let us = get_time_us();
+    let sec = us / 1_000_000;
+    let usec = us % 1_000_000;
+
+    let word_size = size_of::<usize>();
+    let mut bytes = [0u8; 2 * size_of::<usize>()];
+    bytes[..word_size].copy_from_slice(&sec.to_ne_bytes());
+    bytes[word_size..].copy_from_slice(&usec.to_ne_bytes());
+
+    let token = current_user_token();
+    // Validate the whole structure before writing any of its bytes.
+    if !user_range_accessible(token, ts as usize, bytes.len(), PTEFlags::W) {
+        return -1;
+    }
+
+    let mut offset = 0;
+    for buffer in translated_byte_buffer(token, ts as *const u8, bytes.len()) {
+        let len = buffer.len();
+        buffer.copy_from_slice(&bytes[offset..offset + len]);
+        offset += len;
+    }
+    0
 }
 
 /// mmap syscall
