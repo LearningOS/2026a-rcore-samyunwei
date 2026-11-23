@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-samyunwei",
+  "user": "samyunwei",
+  "totalScore": 500,
+  "chapters": {
+    "ch6": {
+      "points": "31/31",
+      "score": 100,
+      "commit": "b4bedb421a33afa5df09a911cdbe04058755a3f6"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "45187769972",
+    "runAttempt": "1"
+  }
+}
